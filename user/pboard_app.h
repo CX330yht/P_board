@@ -30,8 +30,11 @@ typedef struct
 {
     uint8_t online;
     uint8_t address7;
+    uint8_t initialized;
     SoftI2C_Status last_status;
     uint32_t probe_count;
+    uint32_t init_ok_count;
+    uint32_t frame_ok_count;
     uint32_t error_count;
 } PBoardOLEDLink;
 

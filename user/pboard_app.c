@@ -1,12 +1,13 @@
 #include "pboard_app.h"
 #include "board_delay.h"
+#include "oled_ssd1306.h"
 #include "usart.h"
 
 #define SAMPLE_PERIOD_MS      100U
-#define DISPLAY_PERIOD_MS     200U
+#define DISPLAY_PERIOD_MS      25U
 #define HEARTBEAT_PERIOD_MS  1000U
 #define INA_RETRY_PERIOD_MS  1000U
-#define OLED_PROBE_PERIOD_MS 1000U
+#define OLED_RETRY_PERIOD_MS 1000U
 
 volatile PBoardDebug g_pboard_debug;
 volatile PBoardPowerState g_pboard_power;
@@ -16,7 +17,8 @@ static uint32_t last_sample_ms;
 static uint32_t last_display_ms;
 static uint32_t last_heartbeat_ms;
 static uint32_t last_ina_init_ms;
-static uint32_t last_oled_probe_ms;
+static uint32_t last_oled_init_ms;
+static uint8_t next_oled_page;
 
 static void TryInitINA226(void)
 {
@@ -65,13 +67,14 @@ static void UpdatePower(uint32_t now)
     }
 }
 
-static void ProbeOLED(void)
+static void TryInitOLED(void)
 {
     g_pboard_oled_link.probe_count++;
     g_pboard_oled_link.online = 0U;
+    g_pboard_oled_link.initialized = 0U;
     g_pboard_oled_link.address7 = 0U;
+    next_oled_page = 0U;
 
-    /* Candidate addresses only; ACK does not identify the display controller. */
     uint8_t address7 = 0x3CU;
     SoftI2C_Status status = SoftI2C_Probe(address7);
     if (status == SOFT_I2C_NACK)
@@ -80,15 +83,60 @@ static void ProbeOLED(void)
         status = SoftI2C_Probe(address7);
     }
 
+    if (status == SOFT_I2C_OK)
+    {
+        g_pboard_oled_link.address7 = address7;
+        status = OLED_Init(address7);
+    }
     g_pboard_oled_link.last_status = status;
     if (status == SOFT_I2C_OK)
     {
         g_pboard_oled_link.online = 1U;
-        g_pboard_oled_link.address7 = address7;
+        g_pboard_oled_link.initialized = 1U;
+        g_pboard_oled_link.init_ok_count++;
+
+        OLED_DrawString(0U, 0U, "P BOARD");
+        OLED_DrawString(0U, 2U, "SSD1306 128X64");
+        OLED_DrawString(0U, 4U, "OLED TEST OK");
+        OLED_DrawString(0U, 6U, "0123456789");
     }
     else
     {
         g_pboard_oled_link.error_count++;
+    }
+    /* Start the retry interval after the initialization attempt finishes. */
+    last_oled_init_ms = HAL_GetTick();
+}
+
+static void UpdateOLED(uint32_t now)
+{
+    if (g_pboard_oled_link.initialized == 0U)
+    {
+        if ((uint32_t)(now - last_oled_init_ms) >= OLED_RETRY_PERIOD_MS)
+        {
+            TryInitOLED();
+        }
+        return;
+    }
+
+    SoftI2C_Status status = OLED_RefreshPage(next_oled_page);
+    g_pboard_oled_link.last_status = status;
+    if (status == SOFT_I2C_OK)
+    {
+        next_oled_page++;
+        if (next_oled_page >= OLED_PAGE_COUNT)
+        {
+            next_oled_page = 0U;
+            g_pboard_oled_link.frame_ok_count++;
+        }
+    }
+    else
+    {
+        g_pboard_oled_link.online = 0U;
+        g_pboard_oled_link.initialized = 0U;
+        g_pboard_oled_link.error_count++;
+        next_oled_page = 0U;
+        last_oled_init_ms = HAL_GetTick();
     }
 }
 
@@ -99,14 +147,16 @@ void PBoardApp_Init(void)
     g_pboard_debug = (PBoardDebug){0};
     g_pboard_power = (PBoardPowerState){0};
     g_pboard_oled_link = (PBoardOLEDLink){0};
+    /* The four-pin module has no MCU-controlled reset pin. */
+    HAL_Delay(100U);
     TryInitINA226();
-    ProbeOLED();
+    TryInitOLED();
 
     uint32_t now = HAL_GetTick();
     last_sample_ms = now;
     last_display_ms = now;
     last_heartbeat_ms = now;
-    last_oled_probe_ms = now;
+    last_oled_init_ms = now;
 }
 
 void PBoardApp_Process(void)
@@ -123,17 +173,11 @@ void PBoardApp_Process(void)
         UpdatePower(now);
     }
 
-    if ((uint32_t)(now - last_oled_probe_ms) >= OLED_PROBE_PERIOD_MS)
-    {
-        last_oled_probe_ms = now;
-        ProbeOLED();
-    }
-
     if ((uint32_t)(now - last_display_ms) >= DISPLAY_PERIOD_MS)
     {
         last_display_ms = now;
         g_pboard_debug.display_slot_count++;
-        /* TODO: Refresh OLED; only use data when g_pboard_power.valid == 1. */
+        UpdateOLED(now);
     }
 
     if ((uint32_t)(now - last_heartbeat_ms) >= HEARTBEAT_PERIOD_MS)
